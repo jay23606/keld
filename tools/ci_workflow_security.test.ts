@@ -117,6 +117,45 @@ test("rustfmt Cargo command and changed-Rust routing preserve executable failure
   expect(() => check(hiddenCache)).toThrow("rustfmt must not restore or save a compiled Cargo cache");
 });
 
+test("Docker cargo-deny checks do not pay for unused host Cargo compilation cache", () => {
+  const workflow = fixture();
+  const steps = workflow.jobs.deny!.steps;
+  // Both actual audits run inside their own pinned Docker action container,
+  // whose Cargo home differs from the runner's Swatinem/rust-cache paths.
+  expect(steps.some(s => String(s.uses ?? "").toLowerCase().startsWith("swatinem/rust-cache@")))
+    .toBe(false);
+  const docker = steps.filter(s => String(s.uses ?? "").startsWith("EmbarkStudios/cargo-deny-action@"));
+  expect(docker).toHaveLength(2);
+  expect((docker[0]!.with as Step).command).toBe("check");
+  expect((docker[1]!.with as Step)["command-arguments"]).toBe("bans");
+  expect((docker[1]!.with as Step)["manifest-path"]).toBe("crates/keld-updater-helper/Cargo.toml");
+
+  for (const [label, mutate] of [
+    ["restore host cache", (f: Fixture) => {
+      f.jobs.deny!.steps.splice(2, 0, {
+        uses: "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+      });
+    }],
+    ["remove updater helper audit", (f: Fixture) => {
+      f.jobs.deny!.steps = f.jobs.deny!.steps.filter(s => s.name !== "Updater helper edge set (KEL-53 T4d S9c)");
+    }],
+    ["weaken license/bans audit", (f: Fixture) => {
+      const s = step(f, "deny", "Updater helper edge set (KEL-53 T4d S9c)");
+      (s.with as Step)["command-arguments"] = "licenses";
+    }],
+    ["replace docker with arbitrary script", (f: Fixture) => {
+      f.jobs.deny!.steps[2] = { run: "true" };
+    }],
+    ["allow audit failures", (f: Fixture) => {
+      step(f, "deny", "Updater helper edge set (KEL-53 T4d S9c)")["continue-on-error"] = true;
+    }],
+  ] as const) {
+    const f = fixture();
+    mutate(f);
+    expect(() => check(f), label).toThrow("cargo-deny");
+  }
+});
+
 test("inherited custom shells cannot false-green terminal required results", () => {
   for (const scope of ["workflow", "fmt", "required"] as const) {
     const workflow = fixture();
