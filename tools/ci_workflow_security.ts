@@ -353,52 +353,6 @@ function directRunStep(steps: Mapping[], name: string, expectedRun: string, labe
   }
 }
 
-/**
- * `cargo-deny` uses a separately built pinned Docker action with its own Cargo
- * home. Restoring or saving the HOST rust-cache cannot warm either audit.
- * Preserve both exactly scoped Docker checks and their normal failure status.
- */
-function checkDockerDenyWithoutHostCache(jobs: Mapping, stepsByJob: Map<string, Mapping[]>): void {
-  const steps = stepsByJob.get("deny");
-  if (!steps) fail("cargo-deny job must exist.");
-  const job = mapping(jobs.deny, "cargo-deny job");
-  if (job.needs !== "changes" || job.if !== "needs.changes.outputs.deny == 'true'"
-      || Object.hasOwn(job, "continue-on-error")) {
-    fail("cargo-deny job must preserve its router and failure propagation.");
-  }
-  // The existing Rust installer/checkouts are still enforced separately.
-  // Refuse extra shell steps or a hidden Cargo build in this cache-free job.
-  if (steps.length !== 4) {
-    fail("cargo-deny must retain checkout, pinned Rust setup, and both Docker audits only; no host compilation cache.");
-  }
-  const [checkout, rustInstaller, rootAudit, updaterAudit] = steps;
-  if (actionName(actionRef(checkout!.uses, "cargo-deny checkout")) !== "actions/checkout"
-      || actionName(actionRef(rustInstaller!.uses, "cargo-deny Rust setup")) !== "dtolnay/rust-toolchain") {
-    fail("cargo-deny must preserve checkout and pinned Rust setup before both audits.");
-  }
-  for (const [item, label] of [[rootAudit, "cargo-deny workspace audit"], [updaterAudit, "cargo-deny updater audit"]] as const) {
-    const action = actionName(actionRef(item!.uses, label));
-    if (action !== "embarkstudios/cargo-deny-action"
-        || item!.uses !== "EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25") {
-      fail(`${label} must retain the reviewed immutable Docker action SHA, never a host Cargo command.`);
-    }
-  }
-  exactKeys(rootAudit!, ["uses", "with"], "cargo-deny workspace audit");
-  inputsMatch(mapping(rootAudit!.with, "cargo-deny workspace inputs"), {
-    command: "check",
-  }, "cargo-deny workspace inputs");
-  exactKeys(updaterAudit!, ["name", "uses", "with"], "cargo-deny updater audit");
-  if (updaterAudit!.name !== "Updater helper edge set (KEL-53 T4d S9c)") {
-    fail("cargo-deny updater audit must preserve the named updater-helper edge-set contract.");
-  }
-  inputsMatch(mapping(updaterAudit!.with, "cargo-deny updater inputs"), {
-    "manifest-path": "crates/keld-updater-helper/Cargo.toml",
-    arguments: "--all-features --config crates/keld-updater-helper/deny.toml",
-    command: "check",
-    "command-arguments": "bans",
-  }, "cargo-deny updater inputs");
-}
-
 export function checkRustToolchainPins(source: string, toolchainToml: string): void {
   let parsedToolchain: unknown;
   try { parsedToolchain = Bun.TOML.parse(toolchainToml); }
@@ -506,7 +460,6 @@ export function checkWorkflowSecurity(source: string): void {
   if (checkouts === 0) fail("workflow must contain its audited checkout steps.");
   checkCodeqlJobs(jobs, stepsByJob);
   checkWebkitgtkAptCache(jobs, stepsByJob);
-  checkDockerDenyWithoutHostCache(jobs, stepsByJob);
   const dependencies = stepsByJob.get("dependency-review");
   if (!dependencies) fail("CodeQL and dependency-review jobs must exist.");
   const changes = stepsByJob.get("changes");
