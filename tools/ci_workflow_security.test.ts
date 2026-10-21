@@ -219,6 +219,13 @@ test("source-budget reporting stays advisory, visible and unprivileged", () => {
   expect(String(env.KELD_BUDGET_HEAD_SHA)).toContain("github.event.pull_request.head.sha");
 });
 
+test("offline CI attempt reporter regressions execute in the always-on router", () => {
+  const job = step(fixture(), "changes", "CI attempt timing reporter regression tests");
+  expect(String(job.run ?? "").trim()).toBe("python3 -B tools/test_ci_attempt_metrics.py");
+  expect(job.if).toBeUndefined();
+  expect(job["continue-on-error"]).toBeUndefined();
+});
+
 
 
 test("source-budget tool unit tests run in normal unprivileged CI", () => {

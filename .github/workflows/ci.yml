@@ -103,6 +103,10 @@ jobs:
         run: |
           python3 -B tools/test_source_census.py
           python3 -B tools/test_source_budget_report.py
+      # Offline, read-only reporter regression suite. This never calls GitHub
+      # or treats a successful rerun as a first-attempt success.
+      - name: CI attempt timing reporter regression tests
+        run: python3 -B tools/test_ci_attempt_metrics.py
       # The agent playbook router and unsafe-coverage inventory reads crates/*.rs
       # as well as AGENTS and .agents files, so it runs here, where every diff
       # reaches it (#650; it was local-only before).
