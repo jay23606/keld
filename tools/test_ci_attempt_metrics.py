@@ -30,6 +30,8 @@ def run(attempts=1, final="success"):
 def job(job_id, name, created, started, completed, conclusion="success", attempt=1):
     return {
         "id": job_id,
+        "run_id": 39417427592,
+        "head_sha": "a" * 40,
         "name": name,
         "run_attempt": attempt,
         "created_at": stamp(created),
@@ -121,9 +123,67 @@ class AttemptMetricTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "run_attempt"):
             analyse_run(run(), {1: [payload]})
 
+    def test_job_from_another_workflow_run_cannot_attest_required_success(self):
+        alien = job(1, "CI required", 0, 10, 20)
+        alien["run_id"] = 123456789
+        with self.assertRaisesRegex(ValueError, "run_id"):
+            analyse_run(run(), {1: [page(alien)]})
+
+    def test_skipped_job_is_recorded_but_never_charged_as_runner_work(self):
+        selected = job(1, "clippy + test (windows-latest)", 0, 10, 110,
+                       conclusion="skipped")
+        gate = job(2, "CI required", 110, 110, 120)
+        report = analyse_run(run(), {1: [page(selected, gate)]})
+        attempt = report["attempts"][0]
+        self.assertEqual(attempt["skipped_job_count"], 1)
+        self.assertEqual(attempt["observed_runner_seconds"], 10)
+        self.assertIsNone(attempt["jobs"][0]["execution_seconds"])
+
+    def test_cross_revision_job_must_not_attest_required_success(self):
+        alien = job(1, "CI required", 0, 10, 20)
+        alien["head_sha"] = "f" * 40
+        with self.assertRaisesRegex(ValueError, "head_sha"):
+            analyse_run(run(), {1: [page(alien)]})
+
+    def test_required_gate_outside_workflow_clock_cannot_claim_success(self):
+        for impossible in [
+            job(1, "CI required", -100, -90, -80),
+            job(1, "CI required", 0, 100, 10000),
+        ]:
+            with self.subTest(impossible=impossible["id"]), self.assertRaisesRegex(ValueError, "CI required.*outside"):
+                analyse_run(run(), {1: [page(impossible)]})
+
+    def test_prior_attempt_job_cannot_be_billed_twice_as_new_work(self):
+        initial = page(
+            job(1, "gitleaks", 0, 10, 25),
+            job(2, "CI required", 30, 30, 45, conclusion="failure"),
+        )
+        same_job = job(1, "gitleaks", 0, 10, 25, attempt=2)
+        rerun = page(
+            same_job,
+            job(3, "clippy + test (macos-latest)", 5000, 5010, 5060, attempt=2),
+            job(4, "CI required", 5060, 5061, 5080, attempt=2),
+        )
+        report = analyse_run(run(attempts=2), {1: [initial], 2: [rerun]})
+        second = report["attempts"][1]
+        self.assertTrue(second["jobs"][0]["inherited_previous_attempt"])
+        self.assertIsNone(second["jobs"][0]["execution_seconds"])
+        self.assertEqual(second["observed_runner_seconds"], 69)
+        self.assertEqual(second["observed_parallel_wall_seconds"], 80)
+
+    def test_invalid_step_payload_fails_cleanly_and_boolean_attempt_keys_are_refused(self):
+        invalid = job(1, "CI required", 0, 10, 20)
+        invalid["steps"] = {"instead": "of an array"}
+        with self.assertRaisesRegex(ValueError, "steps"):
+            analyse_run(run(), {1: [page(invalid)]})
+        with self.assertRaisesRegex(ValueError, "attempt"):
+            analyse_run(run(), {True: [page(job(1, "CI required", 0, 10, 20))]})
+
     def test_genuine_queue_delay_is_not_counted_as_runner_work(self):
         payload = page(job(1, "CI required", 0, 4740, 4800))
-        report = analyse_run(run(), {1: [payload]})
+        snapshot = run()
+        snapshot["updated_at"] = stamp(4900)
+        report = analyse_run(snapshot, {1: [payload]})
         attempt = report["attempts"][0]
         self.assertEqual(attempt["observed_queued_seconds"], 4740)
         self.assertEqual(attempt["observed_runner_seconds"], 60)

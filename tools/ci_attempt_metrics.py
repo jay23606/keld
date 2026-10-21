@@ -19,6 +19,7 @@ import argparse
 import datetime as dt
 import json
 import pathlib
+import re
 import sys
 
 
@@ -57,16 +58,27 @@ def _ordered_timestamps(record, prefix):
     return "ordered", created, started, ended
 
 
-def _job_measurements(job, attempt):
+def _job_measurements(job, attempt, run_id, head_sha):
     job_id = _positive_int(job.get("id"), "job.id")
+    if type(job.get("run_id")) is not int or job["run_id"] != run_id:
+        raise ValueError(f"job {job_id}: run_id does not match the workflow run")
+    if not isinstance(job.get("head_sha"), str) or job["head_sha"] != head_sha:
+        raise ValueError(f"job {job_id}: head_sha does not match the workflow revision")
     if type(job.get("run_attempt")) is not int or job["run_attempt"] != attempt:
         raise ValueError(f"job {job_id}: run_attempt does not match requested page")
     name = job.get("name")
     if not isinstance(name, str) or not name:
         raise ValueError(f"job {job_id}: missing name")
     quality, created, started, ended = _ordered_timestamps(job, f"job[{job_id}]")
+    executed = (quality == "ordered" and job.get("status") == "completed"
+                and job.get("conclusion") not in (None, "skipped"))
     steps = []
-    for step in job.get("steps") or []:
+    step_records = job.get("steps")
+    if step_records is not None and not isinstance(step_records, list):
+        raise ValueError(f"job {job_id}: steps must be a list")
+    for step in step_records or []:
+        if not isinstance(step, dict):
+            raise ValueError(f"job {job_id}: steps must contain objects")
         start = _timestamp(step.get("started_at"), f"job[{job_id}].step.started_at")
         finish = _timestamp(step.get("completed_at"), f"job[{job_id}].step.completed_at")
         if start is None or finish is None:
@@ -91,6 +103,8 @@ def _job_measurements(job, attempt):
         })
     return {
         "id": job_id,
+        "run_id": run_id,
+        "head_sha": head_sha,
         "name": name,
         "status": job.get("status"),
         "conclusion": job.get("conclusion"),
@@ -98,15 +112,17 @@ def _job_measurements(job, attempt):
         "created_at": job.get("created_at"),
         "started_at": job.get("started_at"),
         "completed_at": job.get("completed_at"),
-        "queued_seconds": _elapsed(created, started) if quality == "ordered" else None,
-        "execution_seconds": _elapsed(started, ended) if quality == "ordered" else None,
+        # Skipped jobs may have synthetic timestamps, but used no runner.
+        "queued_seconds": _elapsed(created, started) if executed else None,
+        "execution_seconds": _elapsed(started, ended) if executed else None,
         "runner_name": job.get("runner_name"),
         "labels": job.get("labels"),
+        "inherited_previous_attempt": False,
         "steps": steps,
     }
 
 
-def _complete_jobs(attempt, pages):
+def _complete_jobs(attempt, pages, run_id, head_sha):
     if not isinstance(pages, list) or not pages:
         raise ValueError(f"attempt {attempt}: incomplete jobs pages (none provided)")
     expected_count = None
@@ -128,7 +144,7 @@ def _complete_jobs(attempt, pages):
             if jid in ids:
                 raise ValueError(f"attempt {attempt}: duplicate job id {jid}")
             ids.add(jid)
-            jobs.append(_job_measurements(job, attempt))
+            jobs.append(_job_measurements(job, attempt, run_id, head_sha))
     if len(jobs) != expected_count:
         raise ValueError(
             f"attempt {attempt}: incomplete jobs pages "
@@ -137,9 +153,21 @@ def _complete_jobs(attempt, pages):
     return jobs
 
 
-def _attempt_summary(number, pages):
-    jobs = _complete_jobs(number, pages)
-    valid = [item for item in jobs if item["time_quality"] == "ordered"]
+def _attempt_summary(number, pages, run_id, head_sha, seen_before):
+    jobs = _complete_jobs(number, pages, run_id, head_sha)
+    for job in jobs:
+        original = seen_before.get(job["id"])
+        if original is not None and all(
+            job[key] == original[key] for key in
+            ("created_at", "started_at", "completed_at", "name", "conclusion")
+        ):
+            # A rerun API page can carry a previous successful job without
+            # executing it again. Retain its status, but do not bill work twice.
+            job["inherited_previous_attempt"] = True
+            job["queued_seconds"] = None
+            job["execution_seconds"] = None
+    ordered = [item for item in jobs if item["time_quality"] == "ordered"]
+    valid = [item for item in ordered if item["execution_seconds"] is not None]
     gates = [item for item in jobs if item["name"] == "CI required"]
     gate = gates[0] if len(gates) == 1 and gates[0]["time_quality"] == "ordered" else None
     result = gate["conclusion"] if gate else None
@@ -155,7 +183,8 @@ def _attempt_summary(number, pages):
         "attempt": number,
         "job_count": len(jobs),
         "timed_job_count": len(valid),
-        "timing_anomalies": len(jobs) - len(valid),
+        "timing_anomalies": len(jobs) - len(ordered),
+        "skipped_job_count": sum(item["conclusion"] == "skipped" for item in jobs),
         "step_timing_anomalies": sum(
             sum(step["time_quality"] != "ordered" for step in job["steps"])
             for job in jobs
@@ -182,19 +211,36 @@ def analyse_run(run, jobs_pages_by_attempt):
     """
     run_id = _positive_int(run.get("id"), "run.id")
     maximum = _positive_int(run.get("run_attempt"), "run.run_attempt")
+    head_sha = run.get("head_sha")
+    if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40,64}", head_sha):
+        raise ValueError("run.head_sha must identify an exact commit")
     created = _timestamp(run.get("created_at"), "run.created_at")
     if created is None:
         raise ValueError("run.created_at is required")
+    updated = _timestamp(run.get("updated_at"), "run.updated_at")
+    if updated is not None and updated < created:
+        raise ValueError("run.updated_at precedes run.created_at")
+    if any(type(attempt) is not int or attempt <= 0 for attempt in jobs_pages_by_attempt):
+        raise ValueError("jobs attempt keys must be positive integers")
     expected = set(range(1, maximum + 1))
     if set(jobs_pages_by_attempt) != expected:
         raise ValueError(
             f"missing attempt or extra attempt: expected {sorted(expected)}, "
             f"received {sorted(jobs_pages_by_attempt)}"
         )
-    attempts = [
-        _attempt_summary(number, jobs_pages_by_attempt[number])
-        for number in sorted(expected)
-    ]
+    attempts = []
+    seen_before = {}
+    for number in sorted(expected):
+        attempt = _attempt_summary(number, jobs_pages_by_attempt[number], run_id,
+                                   head_sha, seen_before)
+        for job in attempt["jobs"]:
+            seen_before[job["id"]] = job
+            if job["name"] == "CI required" and job["time_quality"] == "ordered":
+                gate_created = _timestamp(job["created_at"], "CI required.created_at")
+                gate_end = _timestamp(job["completed_at"], "CI required.completed_at")
+                if gate_created < created or (updated is not None and gate_end > updated):
+                    raise ValueError("CI required completed outside the workflow run's clock bounds")
+        attempts.append(attempt)
     latest = attempts[-1]
     latest_finished = (
         _timestamp(latest["ci_required_completed_at"], "ci_required_completed_at")

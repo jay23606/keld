@@ -7,14 +7,16 @@ import { aptStepTimeoutMinutes, webkitgtkAptJobs, webkitgtkDebCachePath, checkPu
 type Step = Record<string, unknown>;
 type FixtureJob = {
   steps: Step[];
+  defaults?: { run: { shell: string } };
   env?: Record<string, unknown>;
   permissions?: Record<string, unknown>;
   strategy?: { matrix: Record<string, unknown> };
   needs?: unknown;
   if?: unknown;
+  "continue-on-error"?: unknown;
   "timeout-minutes"?: unknown;
 };
-type Fixture = { jobs: Record<string, FixtureJob>; env?: Record<string, unknown> };
+type Fixture = { jobs: Record<string, FixtureJob>; env?: Record<string, unknown>; defaults?: { run: { shell: string } } };
 const source = readFileSync(join(import.meta.dir, "../.github/workflows/ci.yml"), "utf8");
 const windowsMediaOracle = readFileSync(join(import.meta.dir, "../crates/keld-wv/tests/windows_media_guard.ps1"));
 const selectedRustToolchain = readFileSync(join(import.meta.dir, "../rust-toolchain.toml"), "utf8");
@@ -78,6 +80,60 @@ test("rustfmt avoids compiled Cargo cache without reducing format coverage", () 
     const muted = executableFmtLines(fake);
     expect(muted.has("tools/fmt_included.sh test")).toBe(false);
     expect(muted.has("tools/fmt_included.sh --check")).toBe(false);
+  }
+});
+
+test("required included-file format commands cannot be skipped or shell-swallowed", () => {
+  for (const mutation of ["skip", "ignore-error", "swallow-shell", "echo-only"] as const) {
+    const workflow = fixture();
+    const included = step(workflow, "fmt", "rustfmt include!d and macro-body #[path] files");
+    if (mutation === "skip") included.if = false;
+    if (mutation === "ignore-error") included["continue-on-error"] = true;
+    if (mutation === "swallow-shell") included.shell = "bash -c true {0}";
+    if (mutation === "echo-only") {
+      included.run = "echo tools/fmt_included.sh test\necho tools/fmt_included.sh --check";
+    }
+    expect(() => check(workflow)).toThrow("rustfmt included-file commands must execute exactly");
+  }
+});
+
+test("rustfmt Cargo command and changed-Rust routing preserve executable failure", () => {
+  for (const mutation of ["skip", "ignore-error", "swallow-shell", "ignore-script"] as const) {
+    const workflow = fixture();
+    const cargo = workflow.jobs.fmt!.steps.find(candidate => candidate.run === "cargo fmt --all --check")!;
+    if (mutation === "skip") cargo.if = false;
+    if (mutation === "ignore-error") cargo["continue-on-error"] = true;
+    if (mutation === "swallow-shell") cargo.shell = "bash -c true {0}";
+    if (mutation === "ignore-script") cargo.run = "set +e\ncargo fmt --all --check\ntrue";
+    expect(() => check(workflow)).toThrow("rustfmt cargo fmt command must execute exactly");
+  }
+  const skipped = fixture();
+  skipped.jobs.fmt!.if = false;
+  expect(() => check(skipped)).toThrow("rustfmt job must preserve");
+  const hiddenCache = fixture();
+  hiddenCache.jobs.fmt!.steps.splice(2, 0, {
+    uses: "sWatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+  });
+  expect(() => check(hiddenCache)).toThrow("rustfmt must not restore or save a compiled Cargo cache");
+});
+
+test("inherited custom shells cannot false-green terminal required results", () => {
+  for (const scope of ["workflow", "fmt", "required"] as const) {
+    const workflow = fixture();
+    if (scope === "workflow") workflow.defaults = { run: { shell: "bash -c true {0}" } };
+    else workflow.jobs[scope]!.defaults = { run: { shell: "bash -c true {0}" } };
+    expect(() => check(workflow)).toThrow("must not set defaults.run.shell");
+  }
+  const nonblocking = fixture();
+  nonblocking.jobs.required!["continue-on-error"] = true;
+  expect(() => check(nonblocking)).toThrow("CI required must not tolerate failures");
+  for (const mutation of ["skip", "ignore-error", "swallow-shell"] as const) {
+    const workflow = fixture();
+    const evaluator = step(workflow, "required", "Verify required CI results");
+    if (mutation === "skip") evaluator.if = false;
+    if (mutation === "ignore-error") evaluator["continue-on-error"] = true;
+    if (mutation === "swallow-shell") evaluator.shell = "bash -c true {0}";
+    expect(() => check(workflow)).toThrow("CI required evaluator must execute directly");
   }
 });
 
@@ -185,8 +241,10 @@ test("a run step cannot shadow the pinned compiler for later steps", () => {
     ["echo RUSTUP_TOOLCHAIN=stable >> \"$GITHUB_ENV\"", "must not set RUSTUP_TOOLCHAIN"],
     ["RUSTUP_TOOLCHAIN=stable cargo build", "must not set RUSTUP_TOOLCHAIN"],
     ["rustup default stable", "must not change the Rustup default"],
+    ["rustup \"override\" set nightly", "must not change the Rustup default"],
     ["rustup --quiet override set nightly", "must not change the Rustup default"],
     ["rustup \\\n  override set nightly", "must not change the Rustup default"],
+    ["echo RUSTUP_\\\nTOOLCHAIN=stable >> \"$GITHUB_ENV\"", "must not set RUSTUP_TOOLCHAIN"],
   ] as const) {
     const workflow = fixture();
     // Insert after the installer so the existing setup-order rule stays satisfied.
@@ -224,6 +282,18 @@ test("offline CI attempt reporter regressions execute in the always-on router", 
   expect(String(job.run ?? "").trim()).toBe("python3 -B tools/test_ci_attempt_metrics.py");
   expect(job.if).toBeUndefined();
   expect(job["continue-on-error"]).toBeUndefined();
+});
+
+test("CI attempt reporter tests cannot be skipped or shell-swallowed", () => {
+  for (const mutation of ["skip", "ignore-error", "swallow-shell", "echo-only"] as const) {
+    const workflow = fixture();
+    const reporter = step(workflow, "changes", "CI attempt timing reporter regression tests");
+    if (mutation === "skip") reporter.if = false;
+    if (mutation === "ignore-error") reporter["continue-on-error"] = true;
+    if (mutation === "swallow-shell") reporter.shell = "bash -c true {0}";
+    if (mutation === "echo-only") reporter.run = "echo python3 -B tools/test_ci_attempt_metrics.py";
+    expect(() => check(workflow)).toThrow("CI attempt timing reporter tests must execute exactly");
+  }
 });
 
 

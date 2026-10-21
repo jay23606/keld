@@ -321,15 +321,35 @@ function refuseRustupRunOverride(run: unknown, label: string): void {
   if (run === undefined) return;
   const text = scalar(run);
   if (text === undefined) fail(`${label} must be a scalar shell script.`);
-  if (/RUSTUP_TOOLCHAIN/i.test(text)) {
+  // Bash removes line continuations, unquoted escapes and quote delimiters
+  // before resolving command names. Inspect that conservative spelling too:
+  // quoted "override" and RUSTUP_\\<newline>TOOLCHAIN must not evade the pin.
+  const joined = text.replace(/\\\r?\n/g, "").replace(/\\(?=[A-Za-z_])/g, "").replace(/['"]/g, "");
+  if (/RUSTUP_TOOLCHAIN/i.test(joined)) {
     fail(`${label} must not set RUSTUP_TOOLCHAIN; environment overrides outrank rust-toolchain.toml.`);
   }
-  // Shell removes a backslash-newline before executing the command. Inspect
-  // the resulting command as well, so `rustup \\` followed by `override`
-  // cannot hide a directory-level compiler override from this admission gate.
-  const joined = text.replace(/\\\r?\n/g, "");
   if (/\brustup(?:[ \t]+-\S+)*[ \t]+(?:default|override)\b/.test(joined)) {
     fail(`${label} must not change the Rustup default or directory override; either outranks or replaces the pinned toolchain.`);
+  }
+}
+
+function refuseInheritedCustomShell(owner: Mapping, label: string): void {
+  if (!Object.hasOwn(owner, "defaults")) return;
+  const defaults = mapping(owner.defaults, `${label}.defaults`);
+  if (!Object.hasOwn(defaults, "run")) return;
+  const run = mapping(defaults.run, `${label}.defaults.run`);
+  if (Object.hasOwn(run, "shell")) {
+    fail(`${label} must not set defaults.run.shell; an inherited custom shell can hide failed required gates.`);
+  }
+}
+
+function directRunStep(steps: Mapping[], name: string, expectedRun: string, label: string): void {
+  const step = namedStep(steps, name);
+  // No condition, custom shell, or failure-tolerant wrapper may shadow this
+  // literal, reviewed test invocation.
+  if (Object.keys(step).length !== 2 || !Object.hasOwn(step, "name")
+      || !Object.hasOwn(step, "run") || step.run !== expectedRun) {
+    fail(`${label} must execute exactly, with no skip or failure-swallowing controls.`);
   }
 }
 
@@ -404,12 +424,14 @@ export function checkWorkflowSecurity(source: string): void {
   catch (error) { fail(`cannot parse workflow YAML: ${error instanceof Error ? error.message : String(error)}`); }
   finiteGraph(parsed);
   const workflow = mapping(parsed, "workflow (one YAML document)");
+  refuseInheritedCustomShell(workflow, "workflow");
   const jobs = mapping(workflow.jobs, "workflow.jobs");
   if (Object.keys(jobs).length === 0) fail("workflow.jobs must not be empty.");
   const stepsByJob = new Map<string, Mapping[]>();
   let checkouts = 0;
   for (const [jobName, value] of Object.entries(jobs)) {
     const job = mapping(value, `jobs.${jobName}`);
+    refuseInheritedCustomShell(job, `jobs.${jobName}`);
     if (!Array.isArray(job.steps) || job.steps.length === 0 || Object.hasOwn(job, "uses")) {
       fail(`jobs.${jobName} requires a nonempty concrete steps array; opaque/reusable job shapes need a reviewed contract.`);
     }
@@ -444,6 +466,41 @@ export function checkWorkflowSecurity(source: string): void {
   if (!changes) fail("the changes job must exist.");
   namedStep(changes, "Test module import ownership");
   namedStep(changes, "Source budget tool tests");
+  directRunStep(changes, "CI attempt timing reporter regression tests",
+    "python3 -B tools/test_ci_attempt_metrics.py", "CI attempt timing reporter tests");
+  const fmt = stepsByJob.get("fmt");
+  if (!fmt) fail("rustfmt job must exist.");
+  const fmtJob = mapping(jobs.fmt, "jobs.fmt");
+  if (fmtJob.if !== "needs.changes.outputs.rust == 'true'"
+      || Object.hasOwn(fmtJob, "continue-on-error")) {
+    fail("rustfmt job must preserve its changed-Rust routing and failing exit status.");
+  }
+  const fmtCommands = fmt.filter(step => Object.hasOwn(step, "run"));
+  // Other independent run steps cannot suppress the exit status of this step.
+  // Preserve one exact, unwrapped Cargo formatter invocation, but do not
+  // reject unrelated diagnostic steps in the formatting job.
+  const cargoFmtCommands = fmtCommands.filter(step => step.run === "cargo fmt --all --check");
+  if (cargoFmtCommands.length !== 1 || Object.keys(cargoFmtCommands[0]).length !== 1) {
+    fail("rustfmt cargo fmt command must execute exactly and fail on format drift.");
+  }
+  directRunStep(fmt, "rustfmt include!d and macro-body #[path] files",
+    "tools/fmt_included.sh test\ntools/fmt_included.sh --check\n",
+    "rustfmt included-file commands");
+  if (fmt.some(step => typeof step.uses === "string"
+      && actionName(step.uses).startsWith("swatinem/rust-cache"))) {
+    fail("rustfmt must not restore or save a compiled Cargo cache.");
+  }
+  const required = stepsByJob.get("required");
+  if (!required) fail("CI required job must exist.");
+  const requiredJob = mapping(jobs.required, "jobs.required");
+  if (Object.hasOwn(requiredJob, "continue-on-error")) {
+    fail("CI required must not tolerate failures.");
+  }
+  const evaluator = namedStep(required, "Verify required CI results");
+  if (Object.keys(evaluator).length !== 3 || !Object.hasOwn(evaluator, "name")
+      || !Object.hasOwn(evaluator, "env") || typeof evaluator.run !== "string") {
+    fail("CI required evaluator must execute directly without shell, condition or failure swallowing.");
+  }
   const review = requiredAction(dependencies, "Review dependency vulnerabilities", "actions/dependency-review-action", {
     "base-ref": baseRef, "head-ref": headRef, "fail-on-severity": "low",
     "fail-on-scopes": "runtime, development, unknown", "vulnerability-check": "true",
