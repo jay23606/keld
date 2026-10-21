@@ -18,6 +18,17 @@ type Fixture = { jobs: Record<string, FixtureJob>; env?: Record<string, unknown>
 const source = readFileSync(join(import.meta.dir, "../.github/workflows/ci.yml"), "utf8");
 const windowsMediaOracle = readFileSync(join(import.meta.dir, "../crates/keld-wv/tests/windows_media_guard.ps1"));
 const selectedRustToolchain = readFileSync(join(import.meta.dir, "../rust-toolchain.toml"), "utf8");
+// Both versions come from the live pin, so a toolchain bump never turns a
+// mutation below into a silent no-op.
+const selectedRust = String(
+  (Bun.TOML.parse(selectedRustToolchain) as { toolchain: { channel: string } }).toolchain.channel,
+);
+const staleRust = selectedRust.replace(/\.(\d+)$/, (_, patch: string) => `.${Number(patch) + 1}`);
+if (!/^\d+\.\d+\.\d+$/.test(selectedRust) || staleRust === selectedRust) {
+  throw new Error(`rust-toolchain.toml must pin an exact X.Y.Z channel, got ${selectedRust}`);
+}
+const staleRustToolchain = selectedRustToolchain.replace(`"${selectedRust}"`, `"${staleRust}"`);
+if (staleRustToolchain === selectedRustToolchain) throw new Error("stale-pin mutation did not apply");
 const checkout = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
 const requiredRustInstallerJobs = [
   "changes", "fmt", "check", "doctest", "linux-gui-smoke",
@@ -41,6 +52,18 @@ test("actual workflow passes parsed security admission", () => {
   expect(() => checkWorkflowSecurity(source)).not.toThrow();
 });
 
+test("rustfmt avoids compiled Cargo cache without reducing format coverage", () => {
+  const workflow = fixture();
+  const steps = workflow.jobs.fmt!.steps;
+  expect(steps.some(step => String(step.uses ?? "").startsWith("Swatinem/rust-cache@")))
+    .toBe(false);
+  expect(steps.some(step => String(step.run ?? "").trim() === "cargo fmt --all --check"))
+    .toBe(true);
+  const included = steps.find(step => step.name === "rustfmt include!d and macro-body #[path] files");
+  expect(String(included?.run ?? "")).toContain("tools/fmt_included.sh test");
+  expect(String(included?.run ?? "")).toContain("tools/fmt_included.sh --check");
+});
+
 test("every Rust installer agrees with the exact pin and immutable action commit", () => {
   expect(() => checkRustToolchainPins(source, selectedRustToolchain)).not.toThrow();
   const workflow = fixture();
@@ -49,24 +72,24 @@ test("every Rust installer agrees with the exact pin and immutable action commit
   expect(installers.length).toBe(requiredRustInstallerJobs.length);
 
   // A single stale installer may not hide behind nine current copies.
-  (installers[3]!.with as Record<string, unknown>).toolchain = "1.97.1";
+  (installers[3]!.with as Record<string, unknown>).toolchain = staleRust;
   expect(() => checkRustToolchainPins(Bun.YAML.stringify(workflow), selectedRustToolchain))
     .toThrow("must select Rust");
-  (installers[3]!.with as Record<string, unknown>).toolchain = "1.99.1";
+  (installers[3]!.with as Record<string, unknown>).toolchain = selectedRust;
 
   // A changed action SHA is independent from the compiler version, but all
   // jobs must use the same reviewed immutable action implementation.
   installers[3]!.uses = "dtolnay/rust-toolchain@" + "0".repeat(40);
   expect(() => checkRustToolchainPins(Bun.YAML.stringify(workflow), selectedRustToolchain))
     .toThrow("same reviewed immutable");
-  expect(() => checkRustToolchainPins(source, selectedRustToolchain.replace("1.99.1", "1.97.1")))
+  expect(() => checkRustToolchainPins(source, staleRustToolchain))
     .toThrow("must select Rust");
 });
 
 test("Rust toolchain admission reads the actual TOML toolchain table, never a decoy", () => {
-  const decoy = '[decoy]\nchannel = "1.99.1"\n[toolchain]\nchannel = "1.97.1"\ncomponents = ["rustfmt", "clippy"]\n';
+  const decoy = `[decoy]\nchannel = "${selectedRust}"\n[toolchain]\nchannel = "${staleRust}"\ncomponents = ["rustfmt", "clippy"]\n`;
   expect(() => checkRustToolchainPins(source, decoy)).toThrow("must select Rust");
-  const duplicate = '[toolchain]\nchannel = "1.99.1"\nchannel = "1.97.1"\n';
+  const duplicate = `[toolchain]\nchannel = "${selectedRust}"\nchannel = "${staleRust}"\n`;
   expect(() => checkRustToolchainPins(source, duplicate)).toThrow();
 });
 
@@ -138,6 +161,29 @@ test("a Rustup environment override cannot shadow the pinned compiler", () => {
     expect(() => checkRustToolchainPins(Bun.YAML.stringify(workflow), selectedRustToolchain))
       .toThrow("must not override RUSTUP_TOOLCHAIN");
   }
+});
+
+test("a run step cannot shadow the pinned compiler for later steps", () => {
+  for (const [script, message] of [
+    ["echo RUSTUP_TOOLCHAIN=stable >> \"$GITHUB_ENV\"", "must not set RUSTUP_TOOLCHAIN"],
+    ["RUSTUP_TOOLCHAIN=stable cargo build", "must not set RUSTUP_TOOLCHAIN"],
+    ["rustup default stable", "must not change the Rustup default"],
+    ["rustup --quiet override set nightly", "must not change the Rustup default"],
+  ] as const) {
+    const workflow = fixture();
+    // Insert after the installer so the existing setup-order rule stays satisfied.
+    workflow.jobs.fmt!.steps.splice(2, 0, { run: script });
+    expect(() => checkRustToolchainPins(Bun.YAML.stringify(workflow), selectedRustToolchain))
+      .toThrow(message);
+  }
+  // Call-site toolchain selection (the MSRV job's shape) changes nothing for
+  // other commands and stays admitted.
+  const workflow = fixture();
+  workflow.jobs.fmt!.steps.splice(2, 0, {
+    run: "rustup toolchain install 1.0.0 --profile minimal\ncargo +1.0.0 check",
+  });
+  expect(() => checkRustToolchainPins(Bun.YAML.stringify(workflow), selectedRustToolchain))
+    .not.toThrow();
 });
 
 test("source-budget reporting stays advisory, visible and unprivileged", () => {

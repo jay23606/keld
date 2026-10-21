@@ -52,7 +52,9 @@ included_files() {
 # is still open; only a macro invocation (`name! {`) is accepted there.
 path_files() {
     local -a declaring
-    mapfile -t declaring < <(git grep -lE \
+    # macOS still ships Bash 3.2, which has no `mapfile`. Read into the same
+    # array without changing discovery or the fail-closed checks below.
+    while IFS= read -r file; do declaring+=("$file"); done < <(git grep -lE \
         '^[[:space:]]*#[[:space:]]*\[[[:space:]]*(path[[:space:]]*[]=]|cfg_attr[[:space:]]*\(.*[(,[:space:]]path[[:space:]]*=)' \
         -- '*.rs' || true)
     ((${#declaring[@]})) || return 0

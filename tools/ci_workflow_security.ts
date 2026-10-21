@@ -310,6 +310,26 @@ function refuseRustupToolchainOverride(env: unknown, label: string): void {
   }
 }
 
+/**
+ * A run step can shadow the pin for itself and every later step without an
+ * `env:` key: by exporting RUSTUP_TOOLCHAIN (inline or via $GITHUB_ENV), or
+ * through a Rustup default or directory override. Explicit `cargo +<version>`
+ * and `rustup toolchain install` stay admitted: they name their compiler at
+ * the call site (the MSRV job) and change nothing for other commands.
+ */
+function refuseRustupRunOverride(run: unknown, label: string): void {
+  if (run === undefined) return;
+  const text = scalar(run);
+  if (text === undefined) fail(`${label} must be a scalar shell script.`);
+  if (/RUSTUP_TOOLCHAIN/i.test(text)) {
+    fail(`${label} must not set RUSTUP_TOOLCHAIN; environment overrides outrank rust-toolchain.toml.`);
+  }
+  // `rustup [global flags] default|override`, on one shell line.
+  if (/\brustup(?:[ \t]+-\S+)*[ \t]+(?:default|override)\b/.test(text)) {
+    fail(`${label} must not change the Rustup default or directory override; either outranks or replaces the pinned toolchain.`);
+  }
+}
+
 export function checkRustToolchainPins(source: string, toolchainToml: string): void {
   let parsedToolchain: unknown;
   try { parsedToolchain = Bun.TOML.parse(toolchainToml); }
@@ -335,6 +355,7 @@ export function checkRustToolchainPins(source: string, toolchainToml: string): v
     for (const [index, value] of job.steps.entries()) {
       const step = mapping(value, `jobs.${jobName}.steps[${index}]`);
       refuseRustupToolchainOverride(step.env, `jobs.${jobName}.steps[${index}].env`);
+      refuseRustupRunOverride(step.run, `jobs.${jobName}.steps[${index}].run`);
       if (!Object.hasOwn(step, "uses")) continue;
       const label = `jobs.${jobName}.steps[${index}]`;
       const action = actionRef(step.uses, label);

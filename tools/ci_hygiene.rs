@@ -93,7 +93,9 @@ const WORKFLOW_TEXT_NEEDLES: &[&str] = &[
     "sha256sum -c",
     "--test tools/ci_hygiene.rs",
     "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb",
-    "toolchain: 1.99.1",
+    // The Rust compiler pin has one owner: `checkRustToolchainPins` in
+    // tools/ci_workflow_security.ts derives it from rust-toolchain.toml and
+    // checks every installer job (run by this same hygiene step).
     "--test tools/product_status.rs",
     "product-status check .",
     "--test tools/llms_docs.rs",
@@ -2477,7 +2479,6 @@ fn check_workflow(root: &Path) -> Result<(), String> {
             return Err(format!(
                 "CI-HYGIENE: `{WORKFLOW}` is missing `{needle}`. \
                  Restore the gitleaks job (checksummed CLI, not the org-licensed Action), \
-                 `with: toolchain:` on dtolnay/rust-toolchain, \
                 the hygiene job that compiles this file, \
                  generated-doc freshness, and the structural plus digest-pinned Mermaid render gates."
             ));

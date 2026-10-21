@@ -2145,15 +2145,6 @@ fn missing_pr_gate_fails() {
 }
 
 #[test]
-fn missing_toolchain_pin_fails() {
-    let temp = complete_fixture();
-    let workflow = valid_workflow().replace("toolchain: 1.99.1", "");
-    temp.write(WORKFLOW, &workflow);
-    let error = check(temp.path()).expect_err("workflow without toolchain pin must fail");
-    assert!(error.contains("toolchain: 1.99.1"), "{error}");
-}
-
-#[test]
 fn missing_llms_docs_check_fails() {
     let temp = complete_fixture();
     let workflow = valid_workflow()
