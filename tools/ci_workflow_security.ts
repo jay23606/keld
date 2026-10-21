@@ -324,8 +324,11 @@ function refuseRustupRunOverride(run: unknown, label: string): void {
   if (/RUSTUP_TOOLCHAIN/i.test(text)) {
     fail(`${label} must not set RUSTUP_TOOLCHAIN; environment overrides outrank rust-toolchain.toml.`);
   }
-  // `rustup [global flags] default|override`, on one shell line.
-  if (/\brustup(?:[ \t]+-\S+)*[ \t]+(?:default|override)\b/.test(text)) {
+  // Shell removes a backslash-newline before executing the command. Inspect
+  // the resulting command as well, so `rustup \\` followed by `override`
+  // cannot hide a directory-level compiler override from this admission gate.
+  const joined = text.replace(/\\\r?\n/g, "");
+  if (/\brustup(?:[ \t]+-\S+)*[ \t]+(?:default|override)\b/.test(joined)) {
     fail(`${label} must not change the Rustup default or directory override; either outranks or replaces the pinned toolchain.`);
   }
 }

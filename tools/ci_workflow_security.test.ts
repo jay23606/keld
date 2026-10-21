@@ -52,6 +52,13 @@ test("actual workflow passes parsed security admission", () => {
   expect(() => checkWorkflowSecurity(source)).not.toThrow();
 });
 
+function executableFmtLines(run: unknown): Set<string> {
+  // This CI step contains literal commands, not a generated shell program.
+  // Match entire executable lines; echoed text and comments must not satisfy
+  // the test that protects the otherwise-unreachable included Rust files.
+  return new Set(String(run ?? "").split(/\r?\n/).map(line => line.trim()));
+}
+
 test("rustfmt avoids compiled Cargo cache without reducing format coverage", () => {
   const workflow = fixture();
   const steps = workflow.jobs.fmt!.steps;
@@ -60,8 +67,18 @@ test("rustfmt avoids compiled Cargo cache without reducing format coverage", () 
   expect(steps.some(step => String(step.run ?? "").trim() === "cargo fmt --all --check"))
     .toBe(true);
   const included = steps.find(step => step.name === "rustfmt include!d and macro-body #[path] files");
-  expect(String(included?.run ?? "")).toContain("tools/fmt_included.sh test");
-  expect(String(included?.run ?? "")).toContain("tools/fmt_included.sh --check");
+  const lines = executableFmtLines(included?.run);
+  expect(lines.has("tools/fmt_included.sh test")).toBe(true);
+  expect(lines.has("tools/fmt_included.sh --check")).toBe(true);
+  for (const fake of [
+    "echo tools/fmt_included.sh test\necho tools/fmt_included.sh --check",
+    "# tools/fmt_included.sh test\n# tools/fmt_included.sh --check",
+    "true # tools/fmt_included.sh test\ntrue # tools/fmt_included.sh --check",
+  ]) {
+    const muted = executableFmtLines(fake);
+    expect(muted.has("tools/fmt_included.sh test")).toBe(false);
+    expect(muted.has("tools/fmt_included.sh --check")).toBe(false);
+  }
 });
 
 test("every Rust installer agrees with the exact pin and immutable action commit", () => {
@@ -169,6 +186,7 @@ test("a run step cannot shadow the pinned compiler for later steps", () => {
     ["RUSTUP_TOOLCHAIN=stable cargo build", "must not set RUSTUP_TOOLCHAIN"],
     ["rustup default stable", "must not change the Rustup default"],
     ["rustup --quiet override set nightly", "must not change the Rustup default"],
+    ["rustup \\\n  override set nightly", "must not change the Rustup default"],
   ] as const) {
     const workflow = fixture();
     // Insert after the installer so the existing setup-order rule stays satisfied.
