@@ -33,7 +33,7 @@ const staleRustToolchain = selectedRustToolchain.replace(`"${selectedRust}"`, `"
 if (staleRustToolchain === selectedRustToolchain) throw new Error("stale-pin mutation did not apply");
 const checkout = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
 const requiredRustInstallerJobs = [
-  "changes", "fmt", "check", "doctest", "linux-gui-smoke",
+  "changes", "fmt", "check", "windows-media", "doctest", "linux-gui-smoke",
   "msrv", "deny", "hygiene", "mermaid", "codeql-rust",
 ];
 

@@ -298,7 +298,7 @@ export function checkPullRequestTargetWorkflow(source: string, label: string): v
 const approvedRustToolchainAction =
   "dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8";
 const rustToolchainInstallerJobs = new Set([
-  "changes", "fmt", "check", "doctest", "linux-gui-smoke",
+  "changes", "fmt", "check", "windows-media", "doctest", "linux-gui-smoke",
   "msrv", "deny", "hygiene", "mermaid", "codeql-rust",
 ]);
 

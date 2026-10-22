@@ -1469,6 +1469,7 @@ fn check_required_job(text: &str) -> Result<(), String> {
         "dependency-review",
         "workspace-contracts",
         "doctest",
+        "windows-media",
     ];
     let actual_needs = workflow_job_sequence_values(&block, "needs").ok_or_else(|| {
         format!("CI-HYGIENE: `{WORKFLOW}` `required` must declare a structured `needs` sequence.")
@@ -1546,6 +1547,11 @@ fn check_required_job(text: &str) -> Result<(), String> {
         ),
         ("KELD_RESULT_DOCTEST", "${{ needs.doctest.result }}"),
         ("KELD_ROUTE_DOCTEST", "${{ needs.changes.outputs.doctest }}"),
+        ("KELD_RESULT_MEDIA", "${{ needs['windows-media'].result }}"),
+        (
+            "KELD_ROUTE_MEDIA",
+            "${{ needs.changes.outputs.rust == 'true' && contains(needs.changes.outputs.packages, 'keld-wv') }}",
+        ),
     ] {
         if !workflow_named_step_mapping(&block, "Verify required CI results", "env").is_some_and(
             |entries| {
@@ -1575,7 +1581,8 @@ fn check_required_job(text: &str) -> Result<(), String> {
         "\"$KELD_RESULT_DEPENDENCY_REVIEW\" ",
         "\"$KELD_RESULT_WORKSPACE\" \"$KELD_ROUTE_WORKSPACE\" ",
         "\"$KELD_EVENT_NAME\" \"$KELD_ROUTE_RUST_DOCUMENTATION_ONLY\" \"$KELD_ROUTE_CHECK_OS\" ",
-        "\"$KELD_RESULT_DOCTEST\" \"$KELD_ROUTE_DOCTEST\""
+        "\"$KELD_RESULT_DOCTEST\" \"$KELD_ROUTE_DOCTEST\" ",
+        "\"$KELD_RESULT_MEDIA\" \"$KELD_ROUTE_MEDIA\""
     );
     let expected_commands = [
         "tools/ci_required.sh test".to_owned(),
@@ -1585,7 +1592,7 @@ fn check_required_job(text: &str) -> Result<(), String> {
         .unwrap_or_default();
     if actual_commands != expected_commands {
         return Err(format!(
-            "CI-HYGIENE: `{WORKFLOW}` `required` evaluator run block must contain only its self-test and the exact ordered 32-argument check, without control flow, reassignment, wrappers, or exit-status suppression."
+            "CI-HYGIENE: `{WORKFLOW}` `required` evaluator run block must contain only its self-test and the exact ordered 34-argument check, without control flow, reassignment, wrappers, or exit-status suppression."
         ));
     }
 
@@ -1923,32 +1930,44 @@ fn check_product_status_windows_step(text: &str) -> Result<(), String> {
 }
 
 fn check_windows_media_acceptance_step(text: &str) -> Result<(), String> {
-    let Some(check_job) = workflow_job_block(text, "check") else {
+    let Some(check_job) = workflow_job_block(text, "windows-media") else {
         return Err(format!(
-            "CI-HYGIENE: `{WORKFLOW}` has no cross-platform `check` job for KEL-132 Windows media acceptance."
+            "CI-HYGIENE: `{WORKFLOW}` has no isolated `windows-media` job for KEL-132 Windows media acceptance."
         ));
     };
+    let routing = "needs.changes.outputs.rust == 'true' && contains(needs.changes.outputs.packages, 'keld-wv')";
+    if workflow_job_level_property(&check_job, "runs-on").as_deref() != Some("windows-latest")
+        || workflow_job_level_property(&check_job, "needs").as_deref() != Some("changes")
+        || workflow_job_level_if(&check_job).as_deref() != Some(routing)
+        || workflow_job_level_property(&check_job, "continue-on-error").is_some()
+    {
+        return Err(format!(
+            "CI-HYGIENE: `{WORKFLOW}` `windows-media` must run on Windows, need the router, select only Rust/keld-wv changes, and preserve failures (KEL-132)."
+        ));
+    }
+    if workflow_job_block(text, "check").is_some_and(|job| {
+        workflow_direct_named_step_count(&job, "Windows media guard acceptance (KEL-132)") != 0
+    }) {
+        return Err(format!(
+            "CI-HYGIENE: `{WORKFLOW}` KEL-132 media acceptance must not remain in the serial cross-platform `check` job."
+        ));
+    }
     let step = "Windows media guard acceptance (KEL-132)";
     let count = workflow_direct_named_step_count(&check_job, step);
     if count != 1 {
         return Err(format!(
-            "CI-HYGIENE: `{WORKFLOW}` `check` must contain exactly one `{step}` step; found {count}."
+            "CI-HYGIENE: `{WORKFLOW}` `windows-media` must contain exactly one `{step}` step; found {count}."
         ));
     }
     let block = workflow_direct_named_step_block(&check_job, step).ok_or_else(|| {
-        format!("CI-HYGIENE: `{WORKFLOW}` `{step}` must be a direct child of `check.steps`.")
+        format!(
+            "CI-HYGIENE: `{WORKFLOW}` `{step}` must be a direct child of `windows-media.steps`."
+        )
     })?;
-    let expected_keys = ["if".to_owned(), "shell".to_owned(), "run".to_owned()];
+    let expected_keys = ["shell".to_owned(), "run".to_owned()];
     if workflow_named_step_direct_keys(&block, step).as_deref() != Some(expected_keys.as_slice()) {
         return Err(format!(
-            "CI-HYGIENE: `{WORKFLOW}` `{step}` must contain only the exact `if`, `shell: pwsh`, and `run` keys."
-        ));
-    }
-    let expected_condition =
-        "matrix.os == 'windows-latest' && contains(needs.changes.outputs.packages, 'keld-wv')";
-    if workflow_named_step_direct_value(&block, step, "if").as_deref() != Some(expected_condition) {
-        return Err(format!(
-            "CI-HYGIENE: `{WORKFLOW}` `{step}` must use the exact Windows and routed keld-wv condition."
+            "CI-HYGIENE: `{WORKFLOW}` `{step}` must contain only `shell: pwsh` and `run` keys, without a step-level skip."
         ));
     }
     if workflow_named_step_direct_value(&block, step, "shell").as_deref() != Some("pwsh") {

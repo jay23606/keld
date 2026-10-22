@@ -43,7 +43,7 @@ fn windows_media_step() -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "      - name: Windows media guard acceptance (KEL-132)\n        if: matrix.os == 'windows-latest' && contains(needs.changes.outputs.packages, 'keld-wv')\n        shell: pwsh\n        run: |\n{commands}"
+        "      - name: Windows media guard acceptance (KEL-132)\n        shell: pwsh\n        run: |\n{commands}"
     )
 }
 
@@ -163,8 +163,13 @@ fn valid_workflow() -> String {
             "          mkdir -p target/product-status",
             "          rustc --edition=2024 -D warnings --test tools/product_status.rs -o target/product-status/product-status-test",
             "          target/product-status/product-status-test",
-            windows_media_step.as_str(),
             &release_helper_step(),
+            "  windows-media:",
+            "    runs-on: windows-latest",
+            "    needs: changes",
+            "    if: needs.changes.outputs.rust == 'true' && contains(needs.changes.outputs.packages, 'keld-wv')",
+            "    steps:",
+            windows_media_step.as_str(),
             "  bun-test:",
             "    if: needs.changes.outputs.ts == 'true'",
             "    steps:",
@@ -331,6 +336,7 @@ fn valid_workflow() -> String {
             "      - dependency-review",
             "      - workspace-contracts",
             "      - doctest",
+            "      - windows-media",
             "    steps:",
             "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0",
             "        with:",
@@ -369,6 +375,8 @@ fn valid_workflow() -> String {
             "          KELD_ROUTE_CHECK_OS: ${{ needs.changes.outputs.check_os }}",
             "          KELD_RESULT_DOCTEST: ${{ needs.doctest.result }}",
             "          KELD_ROUTE_DOCTEST: ${{ needs.changes.outputs.doctest }}",
+            "          KELD_RESULT_MEDIA: ${{ needs['windows-media'].result }}",
+            "          KELD_ROUTE_MEDIA: ${{ needs.changes.outputs.rust == 'true' && contains(needs.changes.outputs.packages, 'keld-wv') }}",
             "        run: |",
             "          tools/ci_required.sh test",
             "          tools/ci_required.sh check \\",
@@ -387,7 +395,8 @@ fn valid_workflow() -> String {
             "            \"$KELD_RESULT_DEPENDENCY_REVIEW\" \\",
             "            \"$KELD_RESULT_WORKSPACE\" \"$KELD_ROUTE_WORKSPACE\" \\",
             "            \"$KELD_EVENT_NAME\" \"$KELD_ROUTE_RUST_DOCUMENTATION_ONLY\" \"$KELD_ROUTE_CHECK_OS\" \\",
-            "            \"$KELD_RESULT_DOCTEST\" \"$KELD_ROUTE_DOCTEST\"",
+            "            \"$KELD_RESULT_DOCTEST\" \"$KELD_ROUTE_DOCTEST\" \\",
+            "            \"$KELD_RESULT_MEDIA\" \"$KELD_ROUTE_MEDIA\"",
             "",
         ]
         .join("\n")
@@ -1097,7 +1106,7 @@ fn required_result_must_receive_router_applicability() {
         &valid_workflow().replacen("\"$KELD_ROUTE_TS\"", "false", 1),
     );
     let error = check(temp.path()).expect_err("unused router output must fail");
-    assert!(error.contains("32-argument"), "{error}");
+    assert!(error.contains("34-argument"), "{error}");
 }
 
 #[test]
@@ -1109,6 +1118,7 @@ fn required_result_must_observe_security_jobs() {
         "dependency-review",
         "workspace-contracts",
         "doctest",
+        "windows-media",
     ] {
         let workflow = valid_workflow().replacen(&format!("      - {job}\n"), "", 1);
         let error = check_required_job(&workflow).expect_err("missing security job must fail");
@@ -1153,7 +1163,7 @@ fn required_result_must_receive_security_results_without_spoofing() {
         assert!(error.contains(key), "{error}");
         let workflow = valid_workflow().replacen(&format!("\"${key}\""), "success", 1);
         let error = check_required_job(&workflow).expect_err("unused security result must fail");
-        assert!(error.contains("32-argument"), "{error}");
+        assert!(error.contains("34-argument"), "{error}");
     }
 }
 
@@ -2371,11 +2381,64 @@ fn updater_helper_deny_step_is_unique_and_exact() {
 }
 
 #[test]
+fn parallel_windows_media_job_preserves_required_admission() {
+    let base = valid_workflow();
+    for (needle, replacement) in [
+        (
+            "  windows-media:\n    runs-on: windows-latest\n",
+            "  windows-media:\n    runs-on: ubuntu-latest\n",
+        ),
+        (
+            "  windows-media:\n    runs-on: windows-latest\n    needs: changes\n",
+            "  windows-media:\n    runs-on: windows-latest\n",
+        ),
+        (
+            "  windows-media:\n    runs-on: windows-latest\n",
+            "  windows-media:\n    continue-on-error: true\n    runs-on: windows-latest\n",
+        ),
+    ] {
+        assert!(base.contains(needle));
+        let temp = complete_fixture();
+        temp.write(WORKFLOW, &base.replacen(needle, replacement, 1));
+        let error = check(temp.path()).expect_err("media job must reject weakened scope");
+        assert!(
+            error.contains("KEL-132") || error.contains("continue-on-error"),
+            "{error}"
+        );
+    }
+    for (needle, replacement) in [
+        ("      - windows-media\n", ""),
+        (
+            "KELD_RESULT_MEDIA: ${{ needs['windows-media'].result }}",
+            "KELD_RESULT_MEDIA: success",
+        ),
+        (
+            "KELD_ROUTE_MEDIA: ${{ needs.changes.outputs.rust == 'true' && contains(needs.changes.outputs.packages, 'keld-wv') }}",
+            "KELD_ROUTE_MEDIA: false",
+        ),
+        (
+            "\"$KELD_RESULT_MEDIA\" \"$KELD_ROUTE_MEDIA\"",
+            "\"$KELD_RESULT_MEDIA\" false",
+        ),
+    ] {
+        assert!(base.contains(needle), "fixture holds {needle}");
+        let error = check_required_job(&base.replacen(needle, replacement, 1))
+            .expect_err("media gate must reject dropped/spoofed status or applicability");
+        assert!(
+            error.contains("windows-media")
+                || error.contains("MEDIA")
+                || error.contains("34-argument"),
+            "{needle}: {error}"
+        );
+    }
+}
+
+#[test]
 fn windows_media_acceptance_condition_and_shell_are_exact() {
     for (needle, replacement) in [
         (
-            "matrix.os == 'windows-latest' && contains(needs.changes.outputs.packages, 'keld-wv')",
-            "matrix.os == 'windows-latest'",
+            "needs.changes.outputs.rust == 'true' && contains(needs.changes.outputs.packages, 'keld-wv')",
+            "needs.changes.outputs.rust == 'true'",
         ),
         ("        shell: pwsh", "        shell: bash"),
     ] {
