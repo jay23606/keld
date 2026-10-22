@@ -27,7 +27,8 @@ def run(attempts=1, final="success"):
     }
 
 
-def job(job_id, name, created, started, completed, conclusion="success", attempt=1):
+def job(job_id, name, created, started, completed, conclusion="success", attempt=1,
+        runner_name="GitHub Actions 1000000001", runner_id=1000000001):
     return {
         "id": job_id,
         "run_id": 39417427592,
@@ -39,6 +40,8 @@ def job(job_id, name, created, started, completed, conclusion="success", attempt
         "completed_at": stamp(completed),
         "status": "completed",
         "conclusion": conclusion,
+        "runner_name": runner_name,
+        "runner_id": runner_id,
         "steps": [],
     }
 
@@ -214,6 +217,108 @@ class AttemptMetricTests(unittest.TestCase):
         report = analyse_run(run(), {1: [page(selected, gate)]})
         self.assertTrue(report["first_attempt_ci_required_success_observed"])
         self.assertFalse(report["independent_required_gate_provenance_verified"])
+
+    def test_real_cancelled_unassigned_job_has_no_runner_work(self):
+        # Exact first-attempt CodeQL placeholder shape observed in GH run
+        # 39760253424, job 119763025079: no runner or steps were assigned.
+        revision = "960692e8e02f2850b5078061fd1fa9e92d568824"
+        snapshot = {
+            "id": 39760253424,
+            "run_attempt": 1,
+            "head_sha": revision,
+            "created_at": "2026-10-22T10:03:55Z",
+            "status": "completed",
+            "conclusion": "cancelled",
+        }
+        cancelled = {
+            "id": 119763025079,
+            "run_id": 39760253424,
+            "run_attempt": 1,
+            "head_sha": revision,
+            "name": "CodeQL (rust)",
+            "created_at": "2026-10-22T10:05:27Z",
+            "started_at": "2026-10-22T10:05:27Z",
+            "completed_at": "2026-10-22T10:05:27Z",
+            "status": "completed",
+            "conclusion": "cancelled",
+            "runner_id": None,
+            "runner_name": None,
+            "steps": [],
+        }
+        report = analyse_run(snapshot, {1: [page(cancelled)]})
+        attempt = report["attempts"][0]
+        observed = attempt["jobs"][0]
+        self.assertEqual(observed["conclusion"], "cancelled")
+        self.assertEqual(observed["time_quality"], "ordered")
+        self.assertEqual(observed["created_at"], cancelled["created_at"])
+        self.assertEqual(observed["started_at"], cancelled["started_at"])
+        self.assertEqual(observed["completed_at"], cancelled["completed_at"])
+        self.assertEqual(attempt["timed_job_count"], 0)
+        self.assertIsNone(observed["queued_seconds"])
+        self.assertIsNone(observed["execution_seconds"])
+        self.assertEqual(attempt["observed_queued_seconds"], 0)
+        self.assertEqual(attempt["observed_runner_seconds"], 0)
+        self.assertIsNone(attempt["observed_parallel_wall_seconds"])
+        self.assertEqual(attempt["unassigned_cancelled_job_count"], 1)
+        self.assertFalse(observed["runner_assignment_observed"])
+        self.assertIsNone(report["first_attempt_ci_required_success_observed"])
+
+    def test_unassigned_cancelled_placeholder_cannot_extend_work_or_queue(self):
+        active = job(1, "change router", 0, 2, 30)
+        gate = job(2, "CI required", 30, 31, 35, "failure")
+        # Job-level workflow cancellation can report synthetic started_at.
+        pending = job(3, "CodeQL (rust)", 40, 50, 500, "cancelled",
+                      runner_name=None, runner_id=None)
+        report = analyse_run(run(final="failure"), {1: [page(active, gate, pending)]})
+        attempt = report["attempts"][0]
+        self.assertEqual(attempt["jobs"][2]["conclusion"], "cancelled")
+        self.assertIsNone(attempt["jobs"][2]["queued_seconds"])
+        self.assertIsNone(attempt["jobs"][2]["execution_seconds"])
+        self.assertEqual(attempt["observed_runner_seconds"], 32)
+        self.assertEqual(attempt["observed_queued_seconds"], 3)
+        self.assertEqual(attempt["observed_parallel_wall_seconds"], 35)
+        self.assertEqual(attempt["timed_job_count"], 2)
+        self.assertEqual(attempt["unassigned_cancelled_job_count"], 1)
+        self.assertFalse(report["first_attempt_ci_required_success_observed"])
+
+    def test_assigned_cancelled_job_preserves_real_queue_and_runner_execution(self):
+        assigned = job(1, "change router", 0, 5, 25, "cancelled")
+        gate = job(2, "CI required", 25, 26, 30, "failure")
+        report = analyse_run(run(final="failure"), {1: [page(assigned, gate)]})
+        attempt = report["attempts"][0]
+        self.assertTrue(attempt["jobs"][0]["runner_assignment_observed"])
+        self.assertEqual(attempt["jobs"][0]["conclusion"], "cancelled")
+        self.assertEqual(attempt["jobs"][0]["queued_seconds"], 5)
+        self.assertEqual(attempt["jobs"][0]["execution_seconds"], 20)
+        self.assertEqual(attempt["observed_runner_seconds"], 24)
+        self.assertEqual(attempt["observed_queued_seconds"], 6)
+        self.assertEqual(attempt["unassigned_cancelled_job_count"], 0)
+
+    def test_runner_id_is_assignment_evidence_without_name_or_steps(self):
+        assigned = job(1, "clippy + test (macos-latest)", 0, 10, 30,
+                       conclusion="cancelled", runner_name=None, runner_id=12345)
+        report = analyse_run(run(final="cancelled"), {1: [page(assigned)]})
+        measured = report["attempts"][0]["jobs"][0]
+        self.assertTrue(measured["runner_assignment_observed"])
+        self.assertEqual(measured["queued_seconds"], 10)
+        self.assertEqual(measured["execution_seconds"], 20)
+
+    def test_setup_job_step_proves_assignment_without_runner_metadata(self):
+        assigned = job(1, "clippy + test (macos-latest)", 0, 10, 30,
+                       conclusion="cancelled", runner_name=None, runner_id=None)
+        assigned["steps"] = [{
+            "number": 1,
+            "name": "Set up job",
+            "status": "completed",
+            "conclusion": "success",
+            "started_at": stamp(10),
+            "completed_at": stamp(12),
+        }]
+        report = analyse_run(run(final="cancelled"), {1: [page(assigned)]})
+        measured = report["attempts"][0]["jobs"][0]
+        self.assertTrue(measured["runner_assignment_observed"])
+        self.assertEqual(measured["queued_seconds"], 10)
+        self.assertEqual(measured["execution_seconds"], 20)
 
 
 if __name__ == "__main__":

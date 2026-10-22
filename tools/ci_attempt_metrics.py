@@ -5,6 +5,9 @@ Do not interpret the rerun's final green result as first-attempt success.
 GitHub's per-attempt jobs endpoint can show entries whose created_at follows
 started_at. Preserve those records with a warning and exclude them from
 the *new* attempt's queue/execution accounting.
+Cancelled jobs without runner assignment may have synthetic started_at and
+completed_at values. Preserve the cancelled result and raw clocks, but report
+queue/execution seconds as unobserved until runner assignment is evidenced.
 
 Example (capture all pages when the endpoint reports more than 100 jobs):
   gh api repos/gyldlab/keld/actions/runs/RUN_ID > run.json
@@ -70,8 +73,6 @@ def _job_measurements(job, attempt, run_id, head_sha):
     if not isinstance(name, str) or not name:
         raise ValueError(f"job {job_id}: missing name")
     quality, created, started, ended = _ordered_timestamps(job, f"job[{job_id}]")
-    executed = (quality == "ordered" and job.get("status") == "completed"
-                and job.get("conclusion") not in (None, "skipped"))
     steps = []
     step_records = job.get("steps")
     if step_records is not None and not isinstance(step_records, list):
@@ -101,6 +102,21 @@ def _job_measurements(job, attempt, run_id, head_sha):
             "time_quality": step_quality,
             "seconds": _elapsed(start, finish) if step_quality == "ordered" else None,
         })
+    # GitHub may give a cancelled, never-assigned job synthetic started_at and
+    # completed_at values. Job timestamps alone are not evidence of runner work.
+    runner_name = job.get("runner_name")
+    runner_id = job.get("runner_id")
+    runner_assignment_observed = (
+        isinstance(runner_name, str) and bool(runner_name.strip())
+        or type(runner_id) is int and runner_id > 0
+        or any(step["name"] == "Set up job" and
+               step["time_quality"] == "ordered" for step in steps)
+    )
+    executed = (
+        quality == "ordered" and job.get("status") == "completed"
+        and job.get("conclusion") not in (None, "skipped")
+        and runner_assignment_observed
+    )
     return {
         "id": job_id,
         "run_id": run_id,
@@ -112,10 +128,13 @@ def _job_measurements(job, attempt, run_id, head_sha):
         "created_at": job.get("created_at"),
         "started_at": job.get("started_at"),
         "completed_at": job.get("completed_at"),
-        # Skipped jobs may have synthetic timestamps, but used no runner.
+        # No evidence of an assigned runner means queue and execution unknown,
+        # even if synthetic start/end timestamps happen to be ordered.
         "queued_seconds": _elapsed(created, started) if executed else None,
         "execution_seconds": _elapsed(started, ended) if executed else None,
-        "runner_name": job.get("runner_name"),
+        "runner_name": runner_name,
+        "runner_id": runner_id,
+        "runner_assignment_observed": runner_assignment_observed,
         "labels": job.get("labels"),
         "inherited_previous_attempt": False,
         "steps": steps,
@@ -185,6 +204,10 @@ def _attempt_summary(number, pages, run_id, head_sha, seen_before):
         "timed_job_count": len(valid),
         "timing_anomalies": len(jobs) - len(ordered),
         "skipped_job_count": sum(item["conclusion"] == "skipped" for item in jobs),
+        "unassigned_cancelled_job_count": sum(
+            item["conclusion"] == "cancelled"
+            and not item["runner_assignment_observed"] for item in jobs
+        ),
         "step_timing_anomalies": sum(
             sum(step["time_quality"] != "ordered" for step in job["steps"])
             for job in jobs
@@ -280,6 +303,8 @@ def analyse_run(run, jobs_pages_by_attempt):
             "sum of observed runner execution seconds is NOT billed runner-minutes",
             "timestamp-inconsistent rerun records are retained but excluded "
             "from that attempt's work/queue totals; attribution unknown",
+            "cancelled jobs without runner assignment retain their result "
+            "and raw clocks, but have no observed queue/execution duration",
             "workflow-run created_at is not necessarily developer push time",
             "single-run reports do not establish statistical performance gains",
         ],
