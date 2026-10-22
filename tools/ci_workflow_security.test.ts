@@ -329,6 +329,17 @@ test("new Rust test imports require explicit names in normal unprivileged CI", (
   expect(() => check(missing)).toThrow("Test module import ownership must occur exactly once");
 });
 
+test("Windows media runner avoids unused Bun and rustfmt installation", () => {
+  const steps = fixture().jobs["windows-media"]!.steps;
+  const bunSetup = steps.filter(candidate =>
+    typeof candidate.uses === "string" && candidate.uses.toLowerCase().startsWith("oven-sh/setup-bun@"));
+  expect(bunSetup).toHaveLength(0);
+  const installers = steps.filter(candidate =>
+    typeof candidate.uses === "string" && candidate.uses.startsWith("dtolnay/rust-toolchain@"));
+  expect(installers).toHaveLength(1);
+  expect((installers[0]!.with as Record<string, unknown>).components).toBe("clippy");
+});
+
 test("Windows media oracle matches its reviewed full-file digest", () => {
   expect(() => checkWindowsMediaOracle(windowsMediaOracle)).not.toThrow();
   const mutated = Buffer.concat([windowsMediaOracle, Buffer.from("\n# inert override\n")]);
